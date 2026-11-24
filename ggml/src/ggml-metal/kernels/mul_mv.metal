@@ -3154,8 +3154,16 @@ kernel void kernel_mul_mv_mxfp4_f32(
     kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-// NVFP4: a 64-weight block holds four 16-weight sub-blocks, each scaled by its own UE4M3 value.
-// a thread handles the two sub-blocks of one half of the block, so 16 blocks per loop iteration
+// 4 E2M1 nibbles (one per byte of x, values 0..15) -> their values times 2^-14, exact:
+// the nibble's magnitude bits are an fp16 exponent/mantissa pair, its sign bit the fp16 sign
+static inline float4 nvfp4_e2m1x4_scaled(uint32_t x) {
+    const uint32_t e = x & 0x00FF00FFu;        // bytes 0 and 2 in the two 16-bit lanes
+    const uint32_t o = (x >> 8) & 0x00FF00FFu; // bytes 1 and 3
+    const half2 a = as_type<half2>(((e & 0x00080008u) << 12) | ((e & 0x00070007u) << 9));
+    const half2 b = as_type<half2>(((o & 0x00080008u) << 12) | ((o & 0x00070007u) << 9));
+    return float4(a[0], b[0], a[1], b[1]);
+}
+
 template<int NR0, typename args_t>
 void kernel_mul_mv_nvfp4_f32_impl(
         args_t args,
@@ -3187,54 +3195,43 @@ void kernel_mul_mv_nvfp4_f32_impl(
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
     const short ix = tiisg/2;  // 0...15
-    const short it = tiisg%2;  // 0 or 1
+    const short it = tiisg%2;  // 0 or 1, each thread takes 2 of the 4 sub-blocks
 
     float4 yl[8];
     float sumf[NR0]={0.f};
 
-    device const float * yb = y + ix*QK_NVFP4 + it*32;
+    device const float * yb = y + ix*QK_NVFP4 + it*2*QK_NVFP4_SUB;
 
-    // note: just the check `ib < nb` is enough, but adding the redundant `&& ib < ns01` check makes the kernel a bit faster
-    //       no idea why that is - needs some deeper investigation [TAG_MUL_MV_WEIRD]
     for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
         device const float4 * y4 = (device const float4 *) yb;
 
-        yl[0] = y4[0];
-        yl[1] = y4[2];
-        yl[2] = y4[1];
-        yl[3] = y4[3];
-        yl[4] = y4[4];
-        yl[5] = y4[6];
-        yl[6] = y4[5];
-        yl[7] = y4[7];
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            yl[i] = y4[i];
+        }
 
         FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const block_nvfp4 & xb = x[row*ns01 + ib];
+            // a block is 36 bytes, so its scales and quants are 4-byte aligned: word loads, not byte loads
+            device const uint32_t * q32 = (device const uint32_t *) (xb.qs + 2*it*(QK_NVFP4_SUB/2));
+            const uint32_t sc = *((device const uint32_t *) xb.d) >> (16*it);
 
-            // a block is 36 bytes, so its 16 quant bytes are 4-byte aligned and read as four words
-            device const uint32_t * pw = (device const uint32_t *)(xb.qs + 16*it);
+            float sumq = 0.f;
 
-            const uint32_t w0 = pw[0];
-            const uint32_t w1 = pw[1];
-            const uint32_t w2 = pw[2];
-            const uint32_t w3 = pw[3];
+            FOR_UNROLL (short s = 0; s < 2; ++s) {
+                const uint32_t w0 = q32[2*s + 0]; // quants 0..3: low nibbles are elements 0..3, high 8..11
+                const uint32_t w1 = q32[2*s + 1]; // quants 4..7: low nibbles are elements 4..7, high 12..15
 
-            float4 acc1 = yl[0]*e2m1_lo4(w0);
-            float4 acc2 = yl[1]*e2m1_hi4(w0);
-            float4 acc3 = yl[2]*e2m1_lo4(w1);
-            float4 acc4 = yl[3]*e2m1_hi4(w1);
+                float4 acc1 = yl[4*s + 0]*nvfp4_e2m1x4_scaled( w0       & 0x0F0F0F0Fu);
+                float4 acc2 = yl[4*s + 1]*nvfp4_e2m1x4_scaled( w1       & 0x0F0F0F0Fu);
+                float4 acc3 = yl[4*s + 2]*nvfp4_e2m1x4_scaled((w0 >> 4) & 0x0F0F0F0Fu);
+                float4 acc4 = yl[4*s + 3]*nvfp4_e2m1x4_scaled((w1 >> 4) & 0x0F0F0F0Fu);
 
-            float4 acc5 = yl[4]*e2m1_lo4(w2);
-            float4 acc6 = yl[5]*e2m1_hi4(w2);
-            float4 acc7 = yl[6]*e2m1_lo4(w3);
-            float4 acc8 = yl[7]*e2m1_hi4(w3);
+                acc1 = (acc1 + acc3) + (acc2 + acc4);
 
-            acc1 = (acc1 + acc3) + (acc2 + acc4);
-            acc5 = (acc5 + acc7) + (acc6 + acc8);
+                sumq += ue4m3_to_fp32((uint8_t) (sc >> (8*s))) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+            }
 
-            // 16384 undoes the 2^-14 of the decode
-            sumf[row] += ue4m3_to_fp32(xb.d[2*it + 0])*16384.0f*((acc1[0] + acc1[1]) + (acc1[2] + acc1[3])) +
-                         ue4m3_to_fp32(xb.d[2*it + 1])*16384.0f*((acc5[0] + acc5[1]) + (acc5[2] + acc5[3]));
+            sumf[row] += sumq;
         }
 
         yb += 16 * QK_NVFP4;
@@ -3243,7 +3240,8 @@ void kernel_mul_mv_nvfp4_f32_impl(
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
+        // the nibbles were decoded times 2^-14
+        float sum_all = simd_sum(sumf[row]) * 16384.0f;
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
