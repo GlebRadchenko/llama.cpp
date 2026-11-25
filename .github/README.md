@@ -5,13 +5,13 @@ Same GGUF, same quality, **~1.6× decode on an M1 Max**. A pipeline follows Unsl
 
 | M1 Max 64 GB, Inkling-2-Mini UD-Q4_K_XL | stock | this fork |
 |---|---|---|
-| `llama-bench` decode (tg64), on AC power | 23.2 tok/s | **36.5 tok/s** |
-| `llama-server` with Unsloth Studio's flags, chat at effort high | 22.7–22.8 tok/s | **31.0–33.6 tok/s** |
+| `llama-bench` decode (tg64) | 22.5 tok/s | **36.5 tok/s** |
+| `llama-server` with Unsloth Studio's flags, chat at effort high | 21.4–21.7 tok/s | **31.4–32.7 tok/s** |
 | same, as Studio ships it (DSpark speculative decoding on) | 20.0–25.4 tok/s | — |
 | KLD vs a CPU reference, 32 chunks, two texts (lower is better) | 0.00295 / 0.00211 | 0.00277 / 0.00229 |
 | quiz, 10 math questions, effort high | 10/10 | 10/10 |
 
-Speed rows: b12675 on AC power (b12676 merged cleanly; in Low Power Mode on battery both builds drop, to 15.9 and 20.1). KLD: b12676, prose text / this repo's docs; the difference is within noise on one text and borderline (+0.00018 ± 0.00009) on the other, top-token agreement 98.6% vs 98.7%.
+Unsloth b12676, AC power; the DSpark row is from b12675. On battery in Low Power Mode both builds drop (15.9 and 20.1 tok/s), so benchmark on AC. KLD: b12676, prose text / this repo's docs; the difference is within noise on one text and borderline (+0.00018 ± 0.00009) on the other, top-token agreement 98.6% vs 98.7%.
 
 ## Install
 
