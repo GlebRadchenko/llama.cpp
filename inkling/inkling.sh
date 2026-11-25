@@ -80,7 +80,7 @@ cmd_check() {
   local up stock=$OUT/stock text=${TEXT:-$OUT/kld.txt} chunks=${CHUNKS:-32} ref
   up=$(cat inkling/UPSTREAM)
   # default text: this repo's own docs, frozen on first use so the CPU reference stays valid across releases
-  [ -s "$text" ] || cat README.md docs/*.md docs/*/*.md tools/*/README.md 2>/dev/null | head -c 400000 > "$text"
+  [ -s "$text" ] || { cat README.md docs/*.md docs/*/*.md tools/*/README.md 2>/dev/null || true; } | head -c 400000 > "$text"
   ref=$OUT/cpu-$(basename "$MODEL" .gguf)-$chunks.kld
   if [ "$(cat "$stock/VERSION" 2>/dev/null)" != "$up" ]; then
     echo "==> stock build of $up"
