@@ -129,6 +129,19 @@ EOF
       if [ ! -s "$KEYFILE" ]; then # one random key, readable only by you; delete the file and reinstall to rotate
         (umask 077; echo "sk-inkling-$(openssl rand -hex 32)" > "$KEYFILE")
       fi
+      local dir scheme=http tls=() ca=()
+      dir=$(dirname "$KEYFILE")
+      if [ "$host" != 127.0.0.1 ]; then # off this Mac: HTTPS, so the key and the prompts never cross the network in clear
+        scheme=https
+        if [ ! -s "$dir/tls.pem" ]; then # self-signed, made once; delete tls.* and reinstall to renew
+          printf '[req]\ndistinguished_name=dn\n[dn]\n[v3]\nsubjectAltName=DNS:%s.local,DNS:localhost,IP:127.0.0.1,IP:%s\nbasicConstraints=critical,CA:true\nkeyUsage=critical,digitalSignature,keyCertSign\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n' \
+            "$(scutil --get LocalHostName)" "$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo 127.0.0.1)" > "$dir/tls.cnf"
+          (umask 077; openssl ecparam -genkey -name prime256v1 -noout -out "$dir/tls.key")
+          openssl req -x509 -new -key "$dir/tls.key" -days 825 -subj /CN=llama.cpp-inkling -config "$dir/tls.cnf" -extensions v3 -out "$dir/tls.pem"
+        fi
+        tls=(--ssl-key-file "$dir/tls.key" --ssl-cert-file "$dir/tls.pem")
+        ca=(--cacert "$dir/tls.pem")
+      fi
       cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -137,7 +150,7 @@ EOF
   <key>ProgramArguments</key><array>
     <string>$BIN/llama-server</string><string>-m</string><string>$MODEL</string>
     <string>--host</string><string>$host</string><string>--port</string><string>$port</string>
-    <string>--api-key-file</string><string>$KEYFILE</string>
+    <string>--api-key-file</string><string>$KEYFILE</string>$(for a in ${tls[@]+"${tls[@]}"}; do printf '<string>%s</string>' "$a"; done)
     <string>--alias</string><string>${ALIAS:-$(basename "$MODEL" .gguf)}</string>
     <string>-fa</string><string>on</string><string>-c</string><string>${CTX:-65536}</string>
     <string>--parallel</string><string>4</string><string>--kv-unified</string><string>--no-context-shift</string>
@@ -148,15 +161,18 @@ EOF
 </dict></plist>
 EOF
       launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+      for _ in $(seq 20); do launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break; sleep 0.5; done # bootout is async
       launchctl bootstrap "gui/$(id -u)" "$PLIST"
       echo "==> waiting for the model to load"
-      for _ in $(seq 120); do curl -fs "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 1; done
-      curl -fs "http://127.0.0.1:$port/health" >/dev/null || die "not up, see ~/Library/Logs/$LABEL.log"
+      for _ in $(seq 120); do curl -fs ${ca[@]+"${ca[@]}"} "$scheme://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 1; done
+      curl -fs ${ca[@]+"${ca[@]}"} "$scheme://127.0.0.1:$port/health" >/dev/null || die "not up, see ~/Library/Logs/$LABEL.log"
       echo "OpenAI-compatible API, starts at login (log: ~/Library/Logs/$LABEL.log)"
-      echo "  this Mac:     http://127.0.0.1:$port/v1"
+      echo "  this Mac:     $scheme://127.0.0.1:$port/v1"
       if [ "$host" != 127.0.0.1 ]; then
         local ip; ip=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || true)
-        echo "  your network: http://${ip:-<this Mac IP>}:$port/v1   (plain HTTP: use on a network you trust)"
+        echo "  your network: https://${ip:-<this Mac IP>}:$port/v1  or  https://$(scutil --get LocalHostName).local:$port/v1"
+        echo "  certificate:  $dir/tls.pem (public; clients trust this file)"
+        echo "                $(openssl x509 -noout -fingerprint -sha256 -in "$dir/tls.pem")"
       fi
       echo "  API key:      cat $KEYFILE"
       ;;
