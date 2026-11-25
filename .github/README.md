@@ -11,7 +11,7 @@ Same GGUF, same quality, **~1.6× decode on an M1 Max**. A pipeline follows Unsl
 | KLD vs a CPU reference, 32 chunks, two texts (lower is better) | 0.00295 / 0.00211 | 0.00277 / 0.00229 |
 | quiz, 10 math questions, effort high | 10/10 | 10/10 |
 
-Unsloth b12676, AC power; the DSpark row is from b12675. On battery in Low Power Mode both builds drop (15.9 and 20.1 tok/s), so benchmark on AC. KLD: b12676, prose text / this repo's docs; the difference is within noise on one text and borderline (+0.00018 ± 0.00009) on the other, top-token agreement 98.6% vs 98.7%.
+Unsloth b12676, AC power; the DSpark and quiz rows are from b12675. On battery in Low Power Mode both builds drop (15.9 and 20.1 tok/s), so benchmark on AC. KLD: b12676, prose text / this repo's docs; the difference is within noise on one text and borderline (+0.00018 ± 0.00009) on the other, top-token agreement 98.6% vs 98.7%.
 
 ## Install
 
