@@ -5,7 +5,8 @@
 #   inkling/inkling.sh build            static Metal build of this checkout -> build-inkling/bin (stable path for apps)
 #   inkling/inkling.sh check            op tests; with MODEL=<gguf>: speed and KLD against the stock build of the same release
 #   inkling/inkling.sh install studio   build, then the Unsloth Studio steps
-#   inkling/inkling.sh install server   build, then run llama-server as a login service (OpenAI API for any app)
+#   inkling/inkling.sh install server   build, then run llama-server as a login service (OpenAI API for any app);
+#                                       HOST=0.0.0.0 opens it to your network, always behind an API key
 #   inkling/inkling.sh uninstall server
 set -euo pipefail
 
@@ -16,6 +17,7 @@ BIN=$OUT/bin
 REPO=unslothai/llama.cpp
 LABEL=llama.cpp-inkling.server
 PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+KEYFILE=$HOME/.config/llama.cpp-inkling/api-key
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -122,8 +124,11 @@ EOF
     server)
       [ -n "${MODEL:-}" ] || die "set MODEL=<path to the gguf>"
       cmd_build
-      local port=${PORT:-8080}
-      mkdir -p "$(dirname "$PLIST")" "$HOME/Library/Logs"
+      local port=${PORT:-8080} host=${HOST:-127.0.0.1}
+      mkdir -p "$(dirname "$PLIST")" "$HOME/Library/Logs" "$(dirname "$KEYFILE")"
+      if [ ! -s "$KEYFILE" ]; then # one random key, readable only by you; delete the file and reinstall to rotate
+        (umask 077; echo "sk-inkling-$(openssl rand -hex 32)" > "$KEYFILE")
+      fi
       cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -131,7 +136,8 @@ EOF
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
     <string>$BIN/llama-server</string><string>-m</string><string>$MODEL</string>
-    <string>--host</string><string>127.0.0.1</string><string>--port</string><string>$port</string>
+    <string>--host</string><string>$host</string><string>--port</string><string>$port</string>
+    <string>--api-key-file</string><string>$KEYFILE</string>
     <string>--alias</string><string>${ALIAS:-$(basename "$MODEL" .gguf)}</string>
     <string>-fa</string><string>on</string><string>-c</string><string>${CTX:-65536}</string>
     <string>--parallel</string><string>4</string><string>--kv-unified</string><string>--no-context-shift</string>
@@ -146,7 +152,13 @@ EOF
       echo "==> waiting for the model to load"
       for _ in $(seq 120); do curl -fs "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 1; done
       curl -fs "http://127.0.0.1:$port/health" >/dev/null || die "not up, see ~/Library/Logs/$LABEL.log"
-      echo "OpenAI-compatible API: http://127.0.0.1:$port/v1  (starts at login; log: ~/Library/Logs/$LABEL.log)"
+      echo "OpenAI-compatible API, starts at login (log: ~/Library/Logs/$LABEL.log)"
+      echo "  this Mac:     http://127.0.0.1:$port/v1"
+      if [ "$host" != 127.0.0.1 ]; then
+        local ip; ip=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || true)
+        echo "  your network: http://${ip:-<this Mac IP>}:$port/v1   (plain HTTP: use on a network you trust)"
+      fi
+      echo "  API key:      cat $KEYFILE"
       ;;
     *) die "usage: inkling.sh install studio|server" ;;
   esac
