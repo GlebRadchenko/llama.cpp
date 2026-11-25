@@ -333,6 +333,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
         quantize &= name.find(".loop_")               == std::string::npos;
     }
 
+    // dspark: the per-layer feature fusion logits stay F32
+    if (arch == LLM_ARCH_DFLASH) {
+        quantize &= name.find("dspark_fuse.weight") == std::string::npos;
+    }
+
     // zaya1: the top-1 router and the grouped conv kernels stay F32
     if (arch == LLM_ARCH_ZAYA1) {
         quantize &= name.find("ffn_router_")  == std::string::npos;
@@ -358,6 +363,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
+    // keep Inkling's shortconv kernels and rel-proj table unquantized
+    if (arch == LLM_ARCH_INKLING) {
+        quantize &= name.find("shortconv_k.weight")    == std::string::npos;
+        quantize &= name.find("shortconv_v.weight")    == std::string::npos;
+        quantize &= name.find("shortconv_attn.weight") == std::string::npos;
+        quantize &= name.find("shortconv_mlp.weight")  == std::string::npos;
+        quantize &= name.find("attn_rel_proj.weight")  == std::string::npos;
+    }
 
     // metis16: small control tensors that steer every layer; the stream and hc_ tables (ne[0] = 4) would fall back to F16
     if (arch == LLM_ARCH_METIS16) {
@@ -447,6 +460,9 @@ static ggml_type fallback_type_for(const ggml_type target_type) {
         // types on the left, block size 256; types on the right, block size 32
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
@@ -491,6 +507,12 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     LLAMA_LOG_WARN("-> falling back to %7s\n", ggml_type_name(fallback_type));
 
     return fallback_type;
+}
+
+// the narrow-index IQ1 variants sit below IQ1_S and reuse its per-tensor type overrides unchanged,
+// so that a file differs from the IQ1_S build only on the tensors that stay at the IQ1 type
+static bool ftype_is_iq1_narrow(llama_ftype ftype) {
+    return ftype == LLAMA_FTYPE_MOSTLY_IQ1_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_XXXS;
 }
 
 // select the target tensor type based on tensor category, ftype, and model arch
@@ -555,7 +577,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS ||
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ2_S  || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M   ||
-                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
+                     ftype == LLAMA_FTYPE_MOSTLY_IQ1_M   || ftype_is_iq1_narrow(ftype)) {
                 new_type = GGML_TYPE_Q5_K;
             }
             else if (new_type != GGML_TYPE_Q8_0) {
@@ -575,7 +597,8 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             new_type = qs.params->token_embedding_type;
         } else {
             if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS ||
-                ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
+                ftype == LLAMA_FTYPE_MOSTLY_IQ1_S   || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M   ||
+                ftype_is_iq1_narrow(ftype)) {
                 new_type = GGML_TYPE_Q2_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) {
@@ -589,7 +612,8 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
-               ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
+               ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M ||
+               ftype_is_iq1_narrow(ftype)) {
         if (category_is_attn_v(category)) {
             if (qs.model.hparams.n_gqa() >= 4 || qs.model.hparams.n_expert >= 4) { new_type = GGML_TYPE_Q4_K; }
             else { new_type = ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M ? GGML_TYPE_IQ3_S : GGML_TYPE_Q2_K; }
@@ -607,7 +631,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         else if (category == TENSOR_CATEGORY_ATTENTION_OUTPUT) {
             if (qs.model.hparams.n_expert == 8) { new_type = GGML_TYPE_Q5_K; }
             else {
-                if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) { new_type = GGML_TYPE_IQ2_XXS; }
+                if (ftype == LLAMA_FTYPE_MOSTLY_IQ1_S || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M || ftype_is_iq1_narrow(ftype)) { new_type = GGML_TYPE_IQ2_XXS; }
                 else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M) { new_type = GGML_TYPE_IQ3_S; }
             }
         }
@@ -884,7 +908,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
     };
 
     // Quantization types
-    constexpr ggml_type quant_types[] = {
+    static constexpr ggml_type quant_types[] = {
         GGML_TYPE_IQ1_S,
         GGML_TYPE_IQ1_M,
         GGML_TYPE_IQ2_XXS,
@@ -908,16 +932,16 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         GGML_TYPE_BF16,
     };
 
-    constexpr double EPSILON = 1e-12;
-    constexpr double INFINITE = std::numeric_limits<double>::infinity();
-    constexpr uint64_t STATE_MAGIC = 0x4250572d5632; // "BPW-V2"
-    constexpr uint64_t HASH_MAGIC = 0xeabada55cafed00d;
-    constexpr float ffn_down_boost = 6.0f;
-    constexpr float output_boost = 3.0f;
-    constexpr float tied_embd_boost = 2.5f;
-    constexpr float attn_v_boost = 1.25f;
-    constexpr float boost_taper = 2.2f; // boost starves other tensors below 2.2 bpw
-    constexpr double downward_threshold = 0.08; // potential gains smaller than 8% are not trusted
+    static constexpr double EPSILON = 1e-12;
+    static constexpr double INFINITE = std::numeric_limits<double>::infinity();
+    static constexpr uint64_t STATE_MAGIC = 0x4250572d5632; // "BPW-V2"
+    static constexpr uint64_t HASH_MAGIC = 0xeabada55cafed00d;
+    static constexpr float ffn_down_boost = 6.0f;
+    static constexpr float output_boost = 3.0f;
+    static constexpr float tied_embd_boost = 2.5f;
+    static constexpr float attn_v_boost = 1.25f;
+    static constexpr float boost_taper = 2.2f; // boost starves other tensors below 2.2 bpw
+    static constexpr double downward_threshold = 0.08; // potential gains smaller than 8% are not trusted
     const char * func = __func__;
 
     // --target-exclude must leave at least one quant type in the pool
@@ -3080,6 +3104,11 @@ static bool tensor_requires_imatrix(const char * tensor_name, const ggml_type ds
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ1_S:
+        // the narrow-index IQ1 variants search the same lattice as IQ1_S, which is only defined
+        // against per-column importance, so there is no non-imatrix path for them either
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
             return true;
         case GGML_TYPE_Q2_K:
             // as a general rule, the k-type quantizations don't require imatrix data.
@@ -3129,6 +3158,9 @@ ggml_type llama_ftype_get_default_type(const llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_XXS: return GGML_TYPE_IQ3_XXS;
         case LLAMA_FTYPE_MOSTLY_IQ1_S:   return GGML_TYPE_IQ1_S;
         case LLAMA_FTYPE_MOSTLY_IQ1_M:   return GGML_TYPE_IQ1_M;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XS:   return GGML_TYPE_IQ1_XS;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XXS:  return GGML_TYPE_IQ1_XXS;
+        case LLAMA_FTYPE_MOSTLY_IQ1_XXXS: return GGML_TYPE_IQ1_XXXS;
         case LLAMA_FTYPE_MOSTLY_IQ4_NL:  return GGML_TYPE_IQ4_NL;
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:

@@ -130,6 +130,10 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
+// dst[i] = row ids[i] of host table tab as F32, same conversion as CPU GET_ROWS (bitwise equal)
+bool llm_graph_host_rows_supported(const ggml_tensor * tab);
+void llm_graph_host_get_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_ids, float * dst);
+
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
@@ -146,6 +150,10 @@ public:
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
     ggml_tensor * embd_rows    = nullptr; // I32 [n_batch], embd row path: rows of ctx_other's layer input device buffer
+
+    // host-gather mode: token rows are dequantized into `embd` in set_input (no CPU split before the first device)
+    const ggml_tensor * tok_host = nullptr;
+    std::vector<float>  tok_rows;
 
     float scale_tok = 1.0f;
 
@@ -807,6 +815,34 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // [base, swa] device copies, made once per graph
+    ggml_tensor * self_rel_pos_dev[2] = { nullptr, nullptr };
+    ggml_tensor * self_kq_mask_dev[2] = { nullptr, nullptr };
+
+    // [base, swa] K/V cells of the banded attention, 0 = dense
+    uint32_t n_kv_banded[2] = { 0, 0 };
+    bool     banded         = false;
+
+    // padded: the banded attention spans the padded n_kv, which changes only every 256 cells, so that the graph of
+    // a small ubatch is reused. The empty cells past the sequence are masked, and the band is shifted by the padding
+    // through self_rel_shift, the row of the relative bias for each band column, extent past the band (a zero row)
+    bool          banded_pad        = false;
+    bool          banded_swa_dense  = false; // the graph keeps the SWA layers dense
+    ggml_tensor * self_rel_shift[2] = { nullptr, nullptr }; // I32 [extent + n_rel_pad], [extent_swa + n_rel_pad]
+
+    static constexpr uint32_t n_rel_pad = 256;
+
+    // [base, swa] I32 [n_kv] position of each cell (-1 if empty), when the banded attention takes the distances
+    // from the positions: the cells of several sequences, or a wrapped cache. Null when the cells are the positions
+    ggml_tensor * self_k_pos[2] = { nullptr, nullptr };
+    // the banded attention may take the positions (1), else those ubatches are dense (0); 2 takes them for every
+    // banded ubatch, also when the cells are the positions (a check: the result must not change)
+    int banded_pos = 0;
+
+    // [base, swa] cells of the banded attention a graph built for this memory context and ubatch takes,
+    // and whether it takes the positions
+    uint32_t get_n_kv_banded(const llama_kv_cache_context * kv, const llama_ubatch & ubatch, bool & use_pos) const;
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1183,7 +1219,8 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+            enum ggml_prec   prec = GGML_PREC_UNDEFINED) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)
@@ -1297,7 +1334,9 @@ struct llm_graph_context {
     //
 
     // tok_scale: applied to token rows only
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+    // host_gather: gather tok_embd rows on the host in set_input when it lives in host memory (bitwise equal to
+    // GET_ROWS); silently falls back to GET_ROWS when it cannot apply
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f, bool host_gather = false) const;
 
     // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
     // or uploaded from ubatch.embd_state
@@ -1543,10 +1582,11 @@ struct llm_graph_context {
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * kq_b,  // [n_kv, n_rows, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                int64_t   i_row = 0) const; // first mask row of q_cur and kq_b
 
     //
     // pooling
