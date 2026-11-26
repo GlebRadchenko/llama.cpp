@@ -1,17 +1,17 @@
 # llama.cpp · Inkling fork
 
 Faster **Inkling-2-Mini** on Apple Silicon. A fork of [Unsloth's llama.cpp](https://github.com/unslothai/llama.cpp) (what Unsloth Studio ships) with Metal kernels and fused ggml ops for Inkling 2's looped architecture.
-Same GGUF, same quality, **~1.6× decode on an M1 Max**. A pipeline follows Unsloth's daily releases and installs the build into apps.
+Same GGUF, same quality, **~1.5× decode on an M1 Max**. A pipeline follows Unsloth's daily releases and installs the build into apps.
 
 | M1 Max 64 GB, Inkling-2-Mini UD-Q4_K_XL | stock | this fork |
 |---|---|---|
-| `llama-bench` decode (tg64) | 22.5 tok/s | **36.5 tok/s** |
+| `llama-bench` decode (tg64) | 24.8 tok/s | **36.9 tok/s** |
 | `llama-server` with Unsloth Studio's flags, chat at effort high | 21.4–21.7 tok/s | **31.4–32.7 tok/s** |
 | same, as Studio ships it (DSpark speculative decoding on) | 20.0–25.4 tok/s | — |
-| KLD vs a CPU reference, 32 chunks, two texts (lower is better) | 0.00295 / 0.00211 | 0.00277 / 0.00229 |
+| KLD vs a CPU reference, 32 chunks, two texts (lower is better) | 0.00279 / 0.00205 | 0.00277 / 0.00229 |
 | quiz, 10 math questions, effort high | 10/10 | 10/10 |
 
-Unsloth b12676, AC power; the DSpark and quiz rows are from b12675. On battery in Low Power Mode both builds drop (15.9 and 20.1 tok/s), so benchmark on AC. KLD: b12676, prose text / this repo's docs; the difference is within noise on one text and borderline (+0.00018 ± 0.00009) on the other, top-token agreement 98.6% vs 98.7%.
+Unsloth b12722, AC power; the Studio row is from b12676, the DSpark and quiz rows from b12675. On battery in Low Power Mode both builds drop (15.9 and 20.1 tok/s on b12675), so benchmark on AC. KLD: b12722, prose text / this repo's docs; paired per-chunk difference −0.00002 ± 0.00009 and +0.00024 ± 0.00017, both within noise. The fork's outputs are bit-identical to its b12676 build; stock moved with upstream's rewrite of the depth mix.
 
 ## Install
 
@@ -57,7 +57,7 @@ Decode was not memory-bound: ~3.6 GB of weights per token is ~10 ms at the M1 Ma
 | commit | change | decode A/B |
 |---|---|---|
 | [`5d505ab`](https://github.com/GlebRadchenko/llama.cpp/commit/5d505aba) | NVFP4 `mul_mv`: word loads, LUT-free E2M1 decode (two nibbles per half2), 4 rows per simdgroup | +6.7% |
-| [`0c1570f`](https://github.com/GlebRadchenko/llama.cpp/commit/0c1570fe) | QK clip as `t·l2_norm(x, eps=t)`: 23 → 8 dispatches per layer | +8% |
+| [`0c1570f`](https://github.com/GlebRadchenko/llama.cpp/commit/0c1570fe) | QK clip as `t·l2_norm(x, eps=t)`: 23 → 8 dispatches per layer (upstream adopted the same form in b12722) | +8% |
 | [`2d5998a`](https://github.com/GlebRadchenko/llama.cpp/commit/2d5998af) | load-time derived weights; conv residual + scale folded into the taps; Q/K/V loop controllers batched | +8.5% |
 | [`1060000`](https://github.com/GlebRadchenko/llama.cpp/commit/10600002) | new `GGML_GLU_OP_SITU` (softcapped SwiGLU), CPU + Metal: 9 → 1 dispatch | +3.4% |
 | [`97b9a3d`](https://github.com/GlebRadchenko/llama.cpp/commit/97b9a3dc) | one-token relative bias: gather, then project; per-query sink handed to flash attention | +10.6% |
@@ -107,6 +107,7 @@ Inkling-2-Mini at effort high, measured on this machine (Studio API, one sample 
 | b12651-mix-c7059d6 | original work |
 | b12675-mix-d14fe45 | conflicts in 3 commits: upstream landed its own NVFP4 decode (ours kept, faster), dropped a reserve-only block, added a shift for padded banded spans (now reads our clip-folded table), added an MoE amax rescale for other archs |
 | b12676-mix-c32dcc8 | clean merge |
+| b12722-mix-f1c70ea | conflicts in the Inkling 2 graph: upstream took the same `l2_norm` clip (ours kept, it also folds the factor into the attention scale) and switched the depth-mix output and loop messages to `[n_queries, n_embd, n_tokens]`; `DEPTH_MIX` keeps `[n_embd, n_queries, n_tokens]`, so those hunks keep our layout. Took upstream's mask-free causal banded attention (CUDA/CPU only). Stock got 10% faster (22.5 → 24.8 tok/s) |
 
 ## Limits
 
