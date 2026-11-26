@@ -1735,7 +1735,6 @@ struct llama_model_dflash : public llama_model_base {
         void          build_inject_ctx_mix();
         void          store_inject_kv(ggml_tensor * Kcur, ggml_tensor * Vcur, int il);
         ggml_tensor * build_inp_tokens();
-        ggml_tensor * build_inp_block(ggml_tensor * inp_tokens);
         ggml_tensor * build_layers(ggml_tensor * inp_tokens);
         ggml_tensor * build_inkling2_embd(ggml_tensor * inp_tokens);
         ggml_tensor * mix_target_features(ggml_tensor * features, int row, ggml_tensor * norm);
@@ -1781,6 +1780,9 @@ struct llama_model_dflash : public llama_model_base {
 
     // DFlash2 local conv, run by the base layers of DFlash2 and LiliCorr drafts
     static ggml_tensor * build_dflash2_conv(llm_graph_context & g, ggml_tensor * hidden, ggml_tensor * dynamic, ggml_tensor * base, int side);
+
+    // DSpark block input from mask_embd, run by the base layers and the Mistral Large 4 graph
+    static ggml_tensor * build_dspark_inp_block(const llm_graph_context & g, const llama_model & model, ggml_tensor * inp_tokens);
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
@@ -2660,6 +2662,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * mask_banded[2] = { nullptr, nullptr };
         // I32 [n_tokens] query positions of the banded attention, used when it takes the cell positions
         ggml_tensor * q_pos_banded = nullptr;
+        // one sequence in the cache: the full-attention layers take the causal mask from the distances, no mask input
+        bool banded_causal = false;
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;
         llm_graph_input_attn_kv_iswa        * attn = nullptr;
@@ -2678,7 +2682,7 @@ struct llama_model_inkling2 : public llama_model_base {
         std::map<std::pair<ggml_backend_dev_t, std::vector<ggml_tensor *>>, block_stack> mix_states;
         const block_stack * stack(const std::vector<ggml_tensor *> & blocks, int il);
 
-        // the clip thresholds, per layer device, row count and threshold (and the zero sinks, keyed by -n_head)
+        // the zero sinks, per layer device, keyed by -n_head
         std::map<std::pair<std::pair<ggml_backend_dev_t, int64_t>, float>, ggml_tensor *> clip_limits;
     };
 

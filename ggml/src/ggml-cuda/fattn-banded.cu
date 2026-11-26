@@ -238,7 +238,8 @@ static __global__ void flash_attn_ext_banded_f32_split(
         uint64_t r_nb1,
         uint64_t r_nb2,
         uint64_t r_nb3,
-        int64_t rel_ne3) {
+        int64_t rel_ne3,
+        const int causal) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
 
@@ -270,6 +271,10 @@ static __global__ void flash_attn_ext_banded_f32_split(
     const int64_t ik1 = ik0 + chunk < n_kv ? ik0 + chunk : n_kv;
 
     for (int64_t ik = ik0 + warp; ik < ik1; ik += NW) {
+        // causal without a mask: the cells after the query (and the empty ones, with positions) are masked
+        if (causal && fattn_banded_dist(kp, qp, iq, ik, q_offset) < 0) {
+            continue;
+        }
         if (mask && __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) +
                 uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
                 uint64_t(ib % mask_ne3)*m_nb3)) == -INFINITY) {
@@ -634,7 +639,8 @@ static __global__ void flash_attn_ext_banded_vec(
         const int32_t * __restrict__ k_pos,
         const int32_t * __restrict__ q_pos_d,
         const int64_t kpos_s1,
-        const int64_t qpos_s1) {
+        const int64_t qpos_s1,
+        const int causal) {
     constexpr int NT  = fattn_banded_vec_threads;
     constexpr int E   = 8;                 // dimensions per lane
     constexpr int T   = D / E;             // lanes per cell
@@ -723,6 +729,9 @@ static __global__ void flash_attn_ext_banded_vec(
             if (t < NR && c < c_end) {
                 bm[j] = m_row ? __half2float(*(const half *) (m_row + uint64_t(c)*sizeof(half))) : 0.0f;
                 const int64_t dist = kp ? (kp[c] < 0 ? -1 : q_pos - kp[c]) : q_pos - c;
+                if (causal && dist < 0) {
+                    bm[j] = -INFINITY;
+                }
                 if (bm[j] != -INFINITY && dist >= 0 && dist < rel_extent) {
                     bm[j] += fattn_banded_load(r_row + uint64_t(dist)*r_nb0, type_rel);
                 }
@@ -983,6 +992,8 @@ static bool fattn_banded_vec_usable(const ggml_tensor * dst) {
 }
 
 static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+    // ggml_flash_attn_ext_banded_set_causal: no mask, the kernels mask the cells after each query
+    const int causal = ggml_flash_attn_ext_banded_is_causal(dst);
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1036,7 +1047,7 @@ static void fattn_banded_vec_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         m ? m->ne[2] : 1, m ? m->ne[3] : 1, q->nb[1], q->nb[2], q->nb[3], k->nb[1], k->nb[2], k->nb[3], \
         v->nb[1], v->nb[2], v->nb[3], m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2, \
-        k_pos_d, q_pos_d, kpos_s1, qpos_s1)
+        k_pos_d, q_pos_d, kpos_s1, qpos_s1, causal)
 #define LAUNCH_BANDED_VEC_NR(DD, TK, TV) \
     switch (NR) { \
         case 1:  LAUNCH_BANDED_VEC_T(DD, 1, TK, TV); break; \
@@ -1178,6 +1189,95 @@ static __device__ __forceinline__ void fattn_banded_mma_load_tile_q(
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// The quantized tiles of the main loop in two steps, so that the global loads overlap the MMAs as cp.async does for F16:
+// fattn_banded_mma_issue_tile_q only loads the quants and scales of this thread's chunks into registers, fattn_banded_mma_store_chunk_q later
+// dequantizes them into the F16 tile with the values fattn_banded_mma_load_tile_q gives, bit for bit.
+// Rows past n_kv get zero quants and a zero scale, which store as +0 like the zero fill of the one-step load.
+template<int D, int NW>
+struct fattn_banded_mma_qregs {
+    static constexpr int n = fattn_banded_mma_bk*(D/8)/(NW*WARP_SIZE);
+    static_assert(n*NW*WARP_SIZE == fattn_banded_mma_bk*(D/8), "the tile chunks must split evenly over the threads");
+    uint2  q[n];
+    half   d[n];
+};
+
+template<int D, int NW, ggml_type type_kv>
+static __device__ __forceinline__ void fattn_banded_mma_issue_tile_q(
+        fattn_banded_mma_qregs<D, NW> & r, const char * __restrict__ src, const uint64_t nb1, const int64_t kv0, const int64_t n_kv) {
+    static_assert(type_kv == GGML_TYPE_Q8_0 || type_kv == GGML_TYPE_Q4_0, "unsupported banded K/V tile type");
+    constexpr int chunks   = D/8;
+    constexpr int nthreads = NW*WARP_SIZE;
+#pragma unroll
+    for (int i = 0; i < fattn_banded_mma_qregs<D, NW>::n; ++i) {
+        const int c   = i*nthreads + threadIdx.x;
+        const int row = c / chunks;
+        const int col = (c % chunks)*8;
+        // zero quants (byte 0 for q8_0, nibble 8 for q4_0) and a zero scale store +0, as the one-step load does
+        r.q[i] = type_kv == GGML_TYPE_Q8_0 ? make_uint2(0u, 0u) : make_uint2(0x88888888u, 0x88888888u);
+        r.d[i] = __float2half(0.0f);
+        if (kv0 + row < n_kv) {
+            const char * s = src + uint64_t(kv0 + row)*nb1;
+            // the quants of a block start 2 bytes in: 16-bit loads
+            const uint16_t * q16;
+            if constexpr (type_kv == GGML_TYPE_Q8_0) {
+                const block_q8_0 * b = (const block_q8_0 *) s + col/QK8_0;
+                r.d[i] = b->d;
+                q16 = (const uint16_t *) (b->qs + col % QK8_0);
+            } else {
+                const block_q4_0 * b = (const block_q4_0 *) s + col/QK4_0;
+                r.d[i] = b->d;
+                q16 = (const uint16_t *) (b->qs + (col % QK4_0) % (QK4_0/2));
+            }
+            r.q[i].x = q16[0] | ((uint32_t) q16[1] << 16);
+            r.q[i].y = q16[2] | ((uint32_t) q16[3] << 16);
+        }
+    }
+}
+
+// chunk i of this thread's part of the tile
+template<int D, int NW, ggml_type type_kv>
+static __device__ __forceinline__ void fattn_banded_mma_store_chunk_q(half * __restrict__ tile, const fattn_banded_mma_qregs<D, NW> & r, const int i) {
+    constexpr int stride   = D + 8;
+    constexpr int chunks   = D/8;
+    constexpr int nthreads = NW*WARP_SIZE;
+    // a quant u in [0, 255] as the half 1024 + u (exponent byte 0x64), minus 1152 (q8_0, u = q + 128) or 1032 (q4_0, u = q + 8), is exact.
+    // q*d is exact in F32, so one half multiply rounds it as the F32 product rounded to half does.
+    const half2 off = __float2half2_rn(type_kv == GGML_TYPE_Q8_0 ? 1152.0f : 1032.0f);
+    const int c   = i*nthreads + threadIdx.x;
+    const int row = c / chunks;
+    const int col = (c % chunks)*8;
+    const half2 d2 = __half2half2(r.d[i]);
+    const uint32_t w[2] = { r.q[i].x, r.q[i].y };
+    half2 h[4];
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        uint32_t u;
+        if constexpr (type_kv == GGML_TYPE_Q8_0) {
+            u = w[k] ^ 0x80808080u;
+        } else {
+            u = (w[k] >> (col % QK4_0 < QK4_0/2 ? 0 : 4)) & 0x0F0F0F0Fu;
+        }
+        const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+        const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+        h[2*k + 0] = __hmul2(__hsub2(*(const half2 *) &lo, off), d2);
+        h[2*k + 1] = __hmul2(__hsub2(*(const half2 *) &hi, off), d2);
+    }
+    *(int4 *) (tile + row*stride + col) = *(const int4 *) h;
+}
+
+// the chunks of step `step` of n_steps (step is a constant once the calling loop is unrolled): spreading the dequantization over the
+// iterations of an MMA loop lets it issue between the MMAs instead of in front of the next barrier
+template<int D, int NW, ggml_type type_kv, int n_steps>
+static __device__ __forceinline__ void fattn_banded_mma_store_tile_q_step(half * __restrict__ tile, const fattn_banded_mma_qregs<D, NW> & r, const int step) {
+    constexpr int n = fattn_banded_mma_qregs<D, NW>::n;
+#pragma unroll
+    for (int i = 0; i < n; ++i) {
+        if (i*n_steps/n == step) {
+            fattn_banded_mma_store_chunk_q<D, NW, type_kv>(tile, r, i);
+        }
+    }
+}
+
 template<int D, int NW, ggml_type type_kv = GGML_TYPE_F16>
 static __device__ __forceinline__ void fattn_banded_mma_load_tile(
         half * __restrict__ tile, const char * __restrict__ src, const uint64_t nb1, const int64_t kv0, const int64_t n_kv) {
@@ -1301,7 +1401,8 @@ static __global__ void flash_attn_ext_banded_mma(
         const int32_t * __restrict__ k_pos,
         const int32_t * __restrict__ q_pos,
         int64_t kpos_s1,
-        int64_t qpos_s1) {
+        int64_t qpos_s1,
+        const int causal) {
 #ifdef FATTN_BANDED_MMA_AVAILABLE
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     constexpr int BK     = fattn_banded_mma_bk;
@@ -1327,11 +1428,18 @@ static __global__ void flash_attn_ext_banded_mma(
 
     const int64_t n_kt     = (n_kv + BK - 1)/BK;
     const int64_t kt_begin = ic*tiles_per_chunk;
-    const int64_t kt_end   = kt_begin + tiles_per_chunk < n_kt ? kt_begin + tiles_per_chunk : n_kt;
+    int64_t       kt_end   = kt_begin + tiles_per_chunk < n_kt ? kt_begin + tiles_per_chunk : n_kt;
 
     const int64_t iq_w = qt*BQ + warp*16;
     const int64_t iq_r[2] = {iq_w + g, iq_w + g + 8};
     const int64_t q_offset = n_kv - n_q;
+
+    // causal without a mask and with cell distances: the tiles after the last cell the last query of this block sees
+    // are masked whole, skip them (with positions the cells are not in order)
+    if (causal && !k_pos) {
+        const int64_t last = ((qt + 1)*BQ < n_q ? (qt + 1)*BQ : n_q) - 1 + q_offset;
+        kt_end = last < 0 ? kt_begin : (last/BK + 1 < kt_end ? last/BK + 1 : kt_end);
+    }
 
     const char * k_base = k + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3;
     const char * v_base = v + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3;
@@ -1384,6 +1492,15 @@ static __global__ void flash_attn_ext_banded_mma(
         fattn_banded_mma_load_tile<D, NW, type_kv>(K_s, k_base, k_nb1, kt*BK, n_kv);
         fattn_banded_mma_load_tile<D, NW, type_kv>(V_s, v_base, v_nb1, kt*BK, n_kv);
     }
+    // quantized K/V: the tiles after the first are loaded into registers one step ahead (see fattn_banded_mma_issue_tile_q).
+    // Head size 128 only: at 64 the extra registers cost more than the overlap gains (B200, prefill batch), so it keeps the one-step load.
+    constexpr bool q_ahead = type_kv != GGML_TYPE_F16 && D >= 128;
+    fattn_banded_mma_qregs<D, NW> kq;
+    fattn_banded_mma_qregs<D, NW> vq;
+    bool v_pending = false;
+    GGML_UNUSED(kq);
+    GGML_UNUSED(vq);
+    GGML_UNUSED(v_pending);
 
     while (kt < kt_end) {
         const int64_t kv0  = kt*BK;
@@ -1410,6 +1527,13 @@ static __global__ void flash_attn_ext_banded_mma(
                 fattn_banded_mma_16816(S[j + 0], Q_a[kk][0], Q_a[kk][1], Q_a[kk][2], Q_a[kk][3], b[0], b[1]);
                 fattn_banded_mma_16816(S[j + 1], Q_a[kk][0], Q_a[kk][1], Q_a[kk][2], Q_a[kk][3], b[2], b[3]);
             }
+            if constexpr (q_ahead) {
+                // the V tile of this iteration (V_s is free: the PV MMAs of the previous one ended before the barrier above), over
+                // the second half of the QK MMAs so that its loads, issued after the previous PV MMAs, have landed
+                if (v_pending && kk >= NK/2) {
+                    fattn_banded_mma_store_tile_q_step<D, NW, type_kv, NK - NK/2>(V_s, vq, kk - NK/2);
+                }
+            }
         }
 
         const int64_t dist_hi = iq_w + 15 + q_offset - kv0;
@@ -1427,10 +1551,14 @@ static __global__ void flash_attn_ext_banded_mma(
                 if (ik >= n_kv) {
                     s = -INFINITY;
                 } else if (iq_r[r] < n_q) {
-                    if (in_band) {
+                    if (in_band || causal) {
                         const int64_t dist = fattn_banded_dist(kp, qp, iq_r[r], ik, q_offset);
-                        if (dist >= 0 && dist < rel_extent) {
+                        if (in_band && dist >= 0 && dist < rel_extent) {
                             s += fattn_banded_load(r_base + uint64_t(dist)*r_nb0 + uint64_t(iq_r[r])*r_nb2, type_rel);
+                        }
+                        // causal without a mask: the cells after the query (and the empty ones, with positions)
+                        if (causal && dist < 0) {
+                            s = -INFINITY;
                         }
                     }
                     if (flag == 2) {
@@ -1481,7 +1609,11 @@ static __global__ void flash_attn_ext_banded_mma(
 
         __syncthreads();
         const int64_t kt_next = next_tile(kt + 1);
-        if (kt_next < kt_end) {
+        if constexpr (q_ahead) {
+            if (kt_next < kt_end) {
+                fattn_banded_mma_issue_tile_q<D, NW, type_kv>(kq, k_base, k_nb1, kt_next*BK, n_kv);
+            }
+        } else if (kt_next < kt_end) {
             fattn_banded_mma_load_tile<D, NW, type_kv>(K_s, k_base, k_nb1, kt_next*BK, n_kv);
             fattn_banded_mma_wait<1>(); // V tile of this iteration landed
         } else {
@@ -1499,10 +1631,21 @@ static __global__ void flash_attn_ext_banded_mma(
                 fattn_banded_mma_16816(O[n + 0], P_a[2*s][0], P_a[2*s][1], P_a[2*s + 1][0], P_a[2*s + 1][1], b[0], b[1]);
                 fattn_banded_mma_16816(O[n + 1], P_a[2*s][0], P_a[2*s][1], P_a[2*s + 1][0], P_a[2*s + 1][1], b[2], b[3]);
             }
+            if constexpr (q_ahead) {
+                // the next K tile (K_s is free: every warp left the QK MMAs before the barrier above), over the second half of the PV
+                // MMAs so that its loads, issued before them, have landed
+                if (kt_next < kt_end && s >= (BK/16)/2) {
+                    fattn_banded_mma_store_tile_q_step<D, NW, type_kv, BK/16 - (BK/16)/2>(K_s, kq, s - (BK/16)/2);
+                }
+            }
         }
-
         __syncthreads();
-        if (kt_next < kt_end) {
+        if constexpr (q_ahead) {
+            v_pending = kt_next < kt_end;
+            if (v_pending) {
+                fattn_banded_mma_issue_tile_q<D, NW, type_kv>(vq, v_base, v_nb1, kt_next*BK, n_kv);
+            }
+        } else if (kt_next < kt_end) {
             fattn_banded_mma_load_tile<D, NW, type_kv>(V_s, v_base, v_nb1, kt_next*BK, n_kv);
         }
         kt = kt_next;
@@ -1583,6 +1726,12 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     return false;
 #else
     if (dst->op != GGML_OP_FLASH_ATTN_EXT_BANDED) {
+        return false;
+    }
+
+    // the causal attention without a mask runs in the decode, MMA or split kernel; the split kernel puts the queries of
+    // all streams on grid z (at most 65535), so larger ubatches are left to another backend rather than abort
+    if (ggml_flash_attn_ext_banded_is_causal(dst) && dst->src[0] && dst->src[0]->ne[1]*dst->src[0]->ne[3] > 65535) {
         return false;
     }
 
@@ -1671,11 +1820,7 @@ static bool fattn_banded_mma_aligned(const ggml_tensor * t) {
 }
 
 static bool fattn_banded_mma_usable(const int device, const ggml_tensor * dst) {
-    static const bool disabled = [] {
-        const char * env = getenv("GGML_CUDA_DISABLE_BANDED_MMA");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    if (disabled) {
+    if (ggml_cuda_banded_mma_disabled()) {
         return false;
     }
     if (!turing_mma_available(ggml_cuda_info().devices[device].cc)) {
@@ -1717,7 +1862,7 @@ static const ggml_tensor * fattn_banded_kv_to_f16_tensor(ggml_backend_cuda_conte
     uint64_t     nb[4];
     fattn_banded_kv_to_f16(ctx, t, buf, data, type, nb);
     t_f16      = *t;
-    t_f16.data = (void *) data;
+    t_f16.data = const_cast<char *>(data);
     t_f16.type = type;
     for (int i = 0; i < 4; ++i) {
         t_f16.nb[i] = nb[i];
@@ -1726,6 +1871,8 @@ static const ggml_tensor * fattn_banded_kv_to_f16_tensor(ggml_backend_cuda_conte
 }
 
 static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float scale, const int64_t rel_extent) {
+    // ggml_flash_attn_ext_banded_set_causal: no mask, the kernels mask the cells after each query
+    const int causal = ggml_flash_attn_ext_banded_is_causal(dst);
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1829,7 +1976,7 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
         k_nb[1], k_nb[2], k_nb[3], v_nb[1], v_nb[2], v_nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], sinks_s1, sinks_s2, \
-        k_pos_d, q_pos_d, kpos_s1, qpos_s1)
+        k_pos_d, q_pos_d, kpos_s1, qpos_s1, causal)
 #define LAUNCH_BANDED_MMA(DD, NW) \
     switch (type_kv) { \
         case GGML_TYPE_Q8_0: LAUNCH_BANDED_MMA_T(DD, NW, GGML_TYPE_Q8_0); break; \
@@ -1867,6 +2014,8 @@ static void fattn_banded_mma_launch(ggml_backend_cuda_context & ctx, ggml_tensor
 }
 
 void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // ggml_flash_attn_ext_banded_set_causal: no mask, the kernels mask the cells after each query
+    const int causal = ggml_flash_attn_ext_banded_is_causal(dst);
     GGML_ASSERT(ggml_cuda_flash_attn_ext_banded_supported(ctx.device, dst));
 
     const ggml_tensor * q   = dst->src[0];
@@ -1929,7 +2078,8 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         const int64_t target_blocks = int64_t(ggml_cuda_info().devices[ctx.device].nsm)*16;
         int64_t n_chunks = n_rows < target_blocks ? (target_blocks + n_rows - 1)/n_rows : 1;
         n_chunks = std::min<int64_t>(n_chunks, (n_kv + min_chunk - 1)/min_chunk);
-        if (n_chunks > 1 && q->ne[1]*q->ne[3] <= 65535) {
+        // the causal attention without a mask is masked in the split kernel, even in one chunk
+        if ((n_chunks > 1 || causal) && q->ne[1]*q->ne[3] <= 65535) {
             const int64_t chunk = (n_kv + n_chunks - 1)/n_chunks;
             n_chunks = (n_kv + chunk - 1)/chunk;
             const int64_t D = q->ne[0];
@@ -1950,7 +2100,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
                 v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
                 m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
                 k_pos_d, q_pos_d, kpos_s1, qpos_s1, \
-                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3]); \
+                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], causal); \
             flash_attn_ext_banded_f32_merge<DD><<<mblocks, mthreads, 0, stream>>>( \
                 part.get(), (float *) dst->data, n_rows, q->ne[2], q->ne[1], n_chunks, \
                 sinks ? (const float *) sinks->data : nullptr, \
@@ -1966,6 +2116,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
         }
     }
 
+    GGML_ASSERT(!causal && "the causal banded attention without a mask needs the split kernel");
     constexpr int warps_per_block = 4;
     const dim3 blocks((q->ne[1] + warps_per_block - 1) / warps_per_block, q->ne[2], q->ne[3]);
     const dim3 threads(warps_per_block * WARP_SIZE, 1, 1);

@@ -105,7 +105,7 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
 }
 
 static inline float ggml_compute_softplus_f32(float input) {
-    return (input > 20.0f) ? input : logf(1 + expf(input));
+    return (input > 20.0f) ? input : log1pf(expf(input));
 }
 
 // compute correction dims for YaRN RoPE scaling
@@ -192,6 +192,13 @@ static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int3
 static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, float value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(float));
     ((float *)(tensor->op_params))[i] = value;
+}
+
+// GGML_OP_FLASH_ATTN_EXT_BANDED: op param 6 is 1 when the op is causal without a mask (ggml_flash_attn_ext_banded_set_causal)
+#define GGML_FLASH_ATTN_EXT_BANDED_CAUSAL_PARAM 6
+
+static inline bool ggml_flash_attn_ext_banded_is_causal(const struct ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED && ggml_get_op_params_i32(tensor, GGML_FLASH_ATTN_EXT_BANDED_CAUSAL_PARAM) != 0;
 }
 
 struct ggml_map_custom1_op_params {

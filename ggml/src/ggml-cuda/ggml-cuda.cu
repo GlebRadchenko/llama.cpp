@@ -40,6 +40,7 @@
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-f32.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/elem-fuse.cuh"
@@ -2632,6 +2633,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
     const bool use_mmq_few = ggml_cuda_should_use_mmq_few(src0, src1, nullptr, cc);
+    // one column of Q8_0 against F32 activations, without quantizing src1 to q8_1
+    if (!use_mmq_few && ggml_cuda_should_use_mmvq_f32(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_vec_q_f32(ctx, src0, src1, dst);
+        return;
+    }
     if (!use_mmq_few && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -3694,10 +3700,19 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX &&
+        mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
+    }
+
+    if (mode & GGML_ROPE_TYPE_MROPE) {
+        int sections[4];
+        memcpy(sections, (const int32_t *) rope->op_params + 11, sizeof(int) * 4);
+        const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+        if ((sections[0] <= 0 && sections[1] <= 0 && sections[2] <= 0) || sect_dims <= 0) {
+            return false;
+        }
     }
 
     const int n_dims = ((const int32_t *) rope->op_params)[1];
@@ -4804,6 +4819,92 @@ static int ggml_cuda_try_fuse_clip_rows(ggml_backend_cuda_context * cuda_ctx, gg
     return n - 1;
 }
 
+// returns the number of nodes after node i taken by a fused row L2 clip written as [MUL,] L2_NORM, SCALE,
+// 0 if the nodes at i do not form one
+static int ggml_cuda_try_fuse_l2_clip_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_op ops[3];
+    int n = 0;
+
+    const ggml_tensor * m0 = nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_MUL) {
+        m0 = cgraph->nodes[i];
+        ops[n++] = GGML_OP_MUL;
+    }
+    ops[n++] = GGML_OP_L2_NORM;
+    ops[n++] = GGML_OP_SCALE;
+    if (i + n > cgraph->n_nodes) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k] || cgraph->nodes[i + k]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+
+    const ggml_tensor * l2n = cgraph->nodes[i + n - 2];
+    ggml_tensor       * out = cgraph->nodes[i + n - 1];
+    if (out->src[0] != l2n) {
+        return 0;
+    }
+
+    const ggml_tensor * x = l2n->src[0];
+    const ggml_tensor * w = nullptr;
+    if (m0) {
+        // c = x*w, w one row per head broadcast over the tokens
+        w = m0->src[1];
+        if (x != m0 || !ggml_are_same_shape(m0, m0->src[0]) || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+            w->ne[0] != m0->ne[0] || w->ne[1] != m0->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
+            return 0;
+        }
+        x = m0->src[0];
+    }
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(out) || !ggml_are_same_shape(x, out) ||
+        x->ne[0] > INT_MAX || ggml_nrows(x) > INT_MAX) {
+        return 0;
+    }
+
+    float eps;
+    memcpy(&eps, l2n->op_params, sizeof(float));
+    float scale_bias[2];
+    memcpy(scale_bias, out->op_params, sizeof(scale_bias));
+
+    // an in-place node of the chain keeps the separate ops
+    for (int k = 0; k < n - 1; ++k) {
+        if (cgraph->nodes[i + k]->view_src != nullptr) {
+            return 0;
+        }
+    }
+
+    const int out_idx = i + n - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, &out_idx, 1)) {
+        return 0;
+    }
+    // the only inputs from outside the chain are x and w. The allocator may give out the buffer of x, which is dead
+    // after the chain: that is safe, a block reads its whole row before it writes, and then each thread reads an
+    // element before it writes the same element. Any other overlap keeps the separate ops
+    auto range = [](const ggml_tensor * t) {
+        const int64_t a = (int64_t) t->data;
+        return std::make_pair(a, a + (int64_t) ggml_backend_buft_get_alloc_size(t->buffer->buft, t));
+    };
+    auto overlaps = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const auto ra = range(a);
+        const auto rb = range(b);
+        return ra.first < rb.second && rb.first < ra.second;
+    };
+    if (!out->buffer || !x->buffer || (w && !w->buffer)) {
+        return 0;
+    }
+    if (overlaps(out, x) && !(out->data == x->data && ggml_nbytes(out) == ggml_nbytes(x))) {
+        return 0;
+    }
+    if (w && overlaps(out, w)) {
+        return 0;
+    }
+
+    ggml_cuda_op_l2_clip_rows_fused(*cuda_ctx, x, w, eps, scale_bias[0], scale_bias[1], out);
+    return n - 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5103,6 +5204,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL || node->op == GGML_OP_SQR) {
         static const bool clip_rows_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CLIP_ROWS_FUSION");
         const int n_fused = clip_rows_disabled ? 0 : ggml_cuda_try_fuse_clip_rows(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    // row L2 clip as an L2 norm: [MUL,] L2_NORM, SCALE
+    if (node->op == GGML_OP_MUL || node->op == GGML_OP_L2_NORM) {
+        static const bool clip_rows_disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CLIP_ROWS_FUSION");
+        const int n_fused = clip_rows_disabled ? 0 : ggml_cuda_try_fuse_l2_clip_rows(cuda_ctx, cgraph, i);
         if (n_fused > 0) {
             return n_fused;
         }
@@ -6080,6 +6190,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    ggml_cuda_depth_mix_shadow_flush(cuda_ctx, cgraph);
 
     return GGML_STATUS_SUCCESS;
 }

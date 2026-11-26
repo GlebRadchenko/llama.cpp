@@ -17,6 +17,15 @@ static constexpr int64_t n_tokens_banded_min = 32;
 // the banded attention takes the distances from the positions when the cells are not the positions
 // (several sequences in a unified cache, a wrapped SWA cache); LLAMA_INKLING_BANDED_POS=0 keeps those dense,
 // =2 takes the positions for every banded ubatch (a check: the cells that are the positions give the same result)
+// LLAMA_INKLING_BANDED_CAUSAL=0 keeps the mask input of the full-attention layers when the cache holds one sequence
+static bool inkling2_banded_causal_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_INKLING_BANDED_CAUSAL");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static int inkling2_banded_pos_mode() {
     static const int mode = [] {
         const char * env = getenv("LLAMA_INKLING_BANDED_POS");
@@ -465,10 +474,31 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
                     k_pos(i);
                 }
             }
-        } else if (attn->mctx->get_swa()->get_size() < base->get_size()) {
-            // once the positions pass the SWA cache it wraps and its layers take the dense bias for every ubatch
+        } else {
+            // without the positions a cache whose cells are not the positions is dense: a wrapped SWA cache,
+            // a sequence that does not start at cell 0
+            inp->n_kv_banded[0] = 0;
             inp->n_kv_banded[1] = 0;
         }
+    }
+    // the causal attention without a mask (below) runs on the CUDA and CPU kernels only
+    bool causal_devs = true;
+    for (uint32_t il = 0; il < hparams.n_layer() && causal_devs; ++il) {
+        if (hparams.is_swa(il)) {
+            continue;
+        }
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+        causal_devs = strcmp(reg, "CUDA") == 0 || strcmp(reg, "CPU") == 0;
+    }
+    const bool causal_ok = inp->banded && cparams.n_seq_max == 1 && cparams.causal_attn && n_tokens <= 65535 &&
+        causal_devs && inkling2_banded_causal_enabled();
+    // a padded span of 2 or more tokens (drafts, prompt tails) of the full-attention cache takes the positions when the
+    // causal attention applies: it then needs neither the shift table nor the n_kv x n_tokens mask, which the reserve graph
+    // (a full ubatch, causal) does not hold, so the first such span would grow the compute buffers
+    if (causal_ok && inp->banded_pad && n_tokens > 1 && inp->banded_pos != 0 && inp->n_kv_banded[0] > 0 && !inp->self_k_pos[0]) {
+        inp->n_kv_banded[0] = base->get_n_kv();
+        k_pos(0);
     }
     // the band of a padded span is shifted by the padding; with the positions the distances need no shift
     for (int i = 0; i < 2 && inp->banded_pad; ++i) {
@@ -479,6 +509,16 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
             ggml_set_name(shift, i ? "attn_inp_rel_shift_swa" : "attn_inp_rel_shift");
         }
     }
+
+    // a cache of one sequence: a cell is visible iff its distance to the query is not negative (empty cells have no
+    // position), so the full-attention layers need no mask, an n_kv x n_tokens F16 input (1 GiB at 1M cells and 512
+    // tokens, on the host and on the device). Without the positions the distance is a cell difference, which hides
+    // nothing before the sequence: it must start at cell 0 (n_kv_banded is then pos_max + 1, the cells before a later
+    // start are masked by the mask path); padded spans without the positions measure the distance from the padded tail
+    // and keep the mask
+    banded_causal = causal_ok && inp->n_kv_banded[0] > 0 &&
+        (inp->self_k_pos[0] || (!inp->banded_pad && ubatch.pos != nullptr &&
+            inp->n_kv_banded[0] == (uint32_t) ubatch.pos[n_tokens - 1] + 1));
 
     ggml_tensor * inp_pos = build_inp_pos();
     // the query positions of the banded attention
@@ -513,6 +553,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
 
     // the message of controller ctrl, [n_embd, n_tokens], and the messages RMS-normalized once
+    // (ggml_depth_mix keeps the [n_embd, n_queries, n_tokens] layout, so the messages need no transpose)
     ggml_tensor * messages_norm = messages ? ggml_rms_norm(ctx0, messages, 1e-6f) : nullptr;
     auto message = [&](ggml_tensor * t, int ctrl) {
         return ggml_view_2d(ctx0, t, n_embd, n_tokens, t->nb[2], ctrl*t->nb[1]);
@@ -677,12 +718,20 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                 v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv_b, v_all->ne[3],
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
             }
-            ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-            // one banded mask per graph and cache, the first n_kv_b cells of each row read in place
-            ggml_tensor *& m = mask_banded[is_swa];
-            if (!m) {
-                m = ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
-                        mask->nb[1], mask->nb[2], mask->nb[3], 0);
+            // the causal attention without a mask runs on the CUDA and CPU kernels only
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            const char * reg = dev ? ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) : "";
+            const bool causal = !is_swa && banded_causal && (strcmp(reg, "CUDA") == 0 || strcmp(reg, "CPU") == 0);
+            ggml_tensor * m = nullptr;
+            if (!causal) {
+                ggml_tensor * mask = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+                // one banded mask per graph and cache, the first n_kv_b cells of each row read in place
+                ggml_tensor *& mb = mask_banded[is_swa];
+                if (!mb) {
+                    mb = ggml_view_4d(ctx0, mask, n_kv_b, mask->ne[1], mask->ne[2], mask->ne[3],
+                            mask->nb[1], mask->nb[2], mask->nb[3], 0);
+                }
+                m = mb;
             }
             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
             // rel_table: the padded table (zero row last) with the clip factor of R folded in
@@ -698,6 +747,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
             if (inp->self_k_pos[is_swa]) {
                 ggml_flash_attn_ext_banded_set_pos(cur, inp->self_k_pos[is_swa], q_pos_banded);
+            }
+            if (causal) {
+                ggml_flash_attn_ext_banded_set_causal(cur, true);
             }
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
