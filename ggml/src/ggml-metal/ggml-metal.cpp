@@ -296,6 +296,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
             {
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
@@ -311,7 +312,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             } break;
         case GGML_OP_TOP_K:
             {
-                res = 2*sizeof(int32_t)*ggml_nelements(tensor->src[0]);
+                res += ggml_metal_op_top_k_extra(tensor);
             } break;
         case GGML_OP_CONV_2D:
             {

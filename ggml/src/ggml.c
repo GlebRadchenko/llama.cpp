@@ -3387,6 +3387,7 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BANDED:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
@@ -5592,6 +5593,14 @@ void ggml_flash_attn_ext_banded_set_pos(
     a->src[8] = q_pos;
 }
 
+void ggml_flash_attn_ext_banded_set_causal(
+        struct ggml_tensor * a,
+        bool                 causal) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(!causal || a->src[3] == NULL);
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_BANDED_CAUSAL_PARAM, causal ? 1 : 0);
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5654,7 +5663,7 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {    
+bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
     return a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, 5) != 0;
 }
 
